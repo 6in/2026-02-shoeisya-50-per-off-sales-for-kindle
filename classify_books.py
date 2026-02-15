@@ -5,7 +5,16 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+# .env から GEMINI_API_KEY などを読み込む（--use-api 時用）
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(_env_path)
+except ImportError:
+    pass
 
 # カテゴリとキーワード（先にマッチした方を優先するため、具体的なものから並べる）
 CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
@@ -18,9 +27,19 @@ CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
     ("データベース", ["DB設計", "達人に学ぶDB", "データベース", "Oracle Database", "SQL"]),
     ("インフラ・ネットワーク", ["Kubernetes", "Docker", "Linux", "ネットワーク", "インフラ", "サーバー", "クラウド", "ログ"]),
     ("AI・機械学習", ["機械学習", "深層学習", "TensorFlow", "PyTorch"]),
-    # プログラミング・開発を細分化（上のいずれにも当てはまらないもの用）
+    # プログラミング言語別（具体的なキーワードから。先にマッチした方が優先）
     ("Python", ["Python"]),
-    ("Java・Kotlin", ["Java", "Kotlin"]),
+    ("Java", ["Java"]),
+    ("Kotlin", ["Kotlin"]),
+    ("Go", ["Go言語", "Golang", " Go "]),  # "Go" 単体は短いので「Go言語」等を優先
+    ("Rust", ["Rust"]),
+    ("C#", ["C#", "C Sharp", "Unity"]),
+    ("C・C++", ["C言語", "C++"]),
+    ("Ruby", ["Ruby"]),
+    ("PHP", ["PHP"]),
+    ("Swift", ["Swift"]),
+    ("Scala", ["Scala"]),
+    ("R", [" R ", "R言語", "Rで学ぶ", "Rによる"]),  # 単体 "R" は他と被るので文脈付き
     ("Web・フロントエンド", ["JavaScript", "TypeScript", "React", "Vue", "フロントエンド", "HTML", "CSS"]),
     ("Git・開発ツール", ["Git", "GitHub"]),
     ("開発手法・アジャイル", ["アジャイル", "スクラム", "SCRUM", "ドメイン駆動", "DDD", "リファクタリング", "テスト駆動", "TDD", "コードレビュー", "プロダクトマネジメント"]),
@@ -35,6 +54,79 @@ CATEGORY_KEYWORDS: list[tuple[str, list[str]]] = [
 ]
 
 DEFAULT_ENRICHED_NAME = "books_enriched.json"
+DEFAULT_CATEGORIES_NAME = "categories.json"
+
+
+def get_keyword_category_names() -> list[str]:
+    """現在のキーワードルールで定義しているカテゴリ名のリスト（順序保持）。"""
+    return [cat for cat, _ in CATEGORY_KEYWORDS]
+
+
+def extract_categories_to_file(path: Path, category_names: list[str]) -> None:
+    """カテゴリ名の一覧をJSON配列で保存する。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(category_names, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_categories_from_file(path: Path) -> list[str] | None:
+    """data/categories.json などからカテゴリ名の一覧を読み込む。"""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def extract_categories_with_api(books: list[dict], output_path: Path, api_key: str) -> bool:
+    """全タイトルを元にAPIでカテゴリ候補を抽出し、output_path に保存する。"""
+    try:
+        from google import genai
+    except ImportError:
+        print("Run: pip install google-genai")
+        return False
+    titles = [b.get("title") or "" for b in books if b.get("title")]
+    if not titles:
+        return False
+    # 最大で約500件までプロンプトに載せる（トークン制限を考慮）
+    sample = titles[:500] if len(titles) > 500 else titles
+    title_list = "\n".join(f"- {t}" for t in sample)
+    model_name = os.environ.get("MODEL_NAME") or "gemini-2.0-flash"
+    client = genai.Client(api_key=api_key)
+    prompt = f"""以下は翔泳社の技術書・ビジネス書のKindle本タイトル一覧です。
+これらを書店の棚のように分類するとき、読者が探しやすい「カテゴリ名」を考えてください。
+
+【ルール】
+- 日本語でカテゴリ名を付ける
+- 15〜35個程度にまとめる
+- 資格試験系・プログラミング言語・インフラ・ビジネス・デザインなど、内容が分かるようにする
+- 重複や包含関係にならないようにする
+- 返答はJSON配列のみ。説明や改行は入れず、例: ["カテゴリ1", "カテゴリ2"]
+
+【タイトル一覧】
+{title_list}
+
+【上記を踏まえたカテゴリ名のJSON配列】"""
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+        )
+        text = (response.text or "").strip()
+        # コードブロックを外す
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        arr = json.loads(text)
+        if not isinstance(arr, list) or not all(isinstance(x, str) for x in arr):
+            print("API returned invalid format.")
+            return False
+        extract_categories_to_file(output_path, arr)
+        print(f"Extracted {len(arr)} categories (from API) -> {output_path}")
+        return True
+    except Exception as e:
+        print(f"API error: {e}")
+        return False
 
 
 def classify_by_keywords(title: str) -> tuple[str, list[str]]:
@@ -90,7 +182,46 @@ def main():
         action="store_true",
         help="既に category が付いている書籍も再分類する",
     )
+    parser.add_argument(
+        "--extract-categories",
+        action="store_true",
+        help="全カテゴリ一覧を data/categories.json に出力する（キーワード定義から抽出。APIで抽出する場合は --use-api を併用）",
+    )
+    parser.add_argument(
+        "--use-api",
+        action="store_true",
+        help="--extract-categories 時: タイトルをAPIに送り、カテゴリ候補を抽出する。要 GOOGLE_API_KEY",
+    )
+    parser.add_argument(
+        "--categories-file",
+        type=Path,
+        metavar="FILE",
+        default=Path("data/categories.json"),
+        help="extract 時の出力先 / 分類時に参照するカテゴリ一覧 (default: data/categories.json)",
+    )
     args = parser.parse_args()
+
+    # カテゴリ抽出のみ（分類は行わない）
+    if args.extract_categories:
+        if args.use_api:
+            if not args.input.exists():
+                print(f"Error: {args.input} not found.")
+                return 1
+            books = load_books(args.input)
+            if not books:
+                print("No books in input.")
+                return 1
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if not api_key:
+                print("Set GEMINI_API_KEY in .env (or GOOGLE_API_KEY) to use --use-api.")
+                return 1
+            if not extract_categories_with_api(books, args.categories_file, api_key):
+                return 1
+        else:
+            names = get_keyword_category_names()
+            extract_categories_to_file(args.categories_file, names)
+            print(f"Extracted {len(names)} categories (from keyword rules) -> {args.categories_file}")
+        return 0
 
     if not args.input.exists():
         print(f"Error: {args.input} not found.")

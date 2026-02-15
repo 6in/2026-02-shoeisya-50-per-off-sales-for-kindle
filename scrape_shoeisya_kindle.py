@@ -169,6 +169,28 @@ def save_merged_json(books: list[dict], path: Path) -> None:
     print(f"Merged {len(books)} books -> {path}")
 
 
+def _load_category_order() -> list[str]:
+    """data/categories.json があればその順序を返す。なければ既定の順序。"""
+    default = [
+        "資格試験・PMP", "資格試験・G検定", "資格試験・AWS", "資格試験・Azure",
+        "資格試験・オラクル", "資格試験・シスコ", "資格試験・その他",
+        "データベース", "インフラ・ネットワーク", "AI・機械学習",
+        "Python", "Java・Kotlin", "Web・フロントエンド", "Git・開発ツール",
+        "開発手法・アジャイル", "設計・アーキテクチャ", "プログラミング・開発",
+        "デザイン", "投資・金融", "ビジネス・マネジメント", "メンタル・自己啓発", "その他",
+    ]
+    path = Path("data/categories.json")
+    if not path.exists():
+        return default
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list) and data and all(isinstance(x, str) for x in data):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return default
+
+
 def _book_to_card(b: dict) -> str:
     """1冊分のカードHTMLを返す。"""
     title_esc = b["title"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
@@ -217,18 +239,15 @@ def generate_html(books: list[dict], output_path: Path) -> None:
     </ul>
 """
     else:
-        # カテゴリ別にグループ化（表示順を固定）
-        category_order = [
-            "資格試験・PMP", "資格試験・G検定", "資格試験・AWS", "資格試験・Azure",
-            "資格試験・オラクル", "資格試験・シスコ", "資格試験・その他",
-            "データベース", "インフラ・ネットワーク", "AI・機械学習",
-            "Python", "Java・Kotlin", "Web・フロントエンド", "Git・開発ツール",
-            "開発手法・アジャイル", "設計・アーキテクチャ", "プログラミング・開発",
-            "デザイン", "投資・金融", "ビジネス・マネジメント", "メンタル・自己啓発", "その他",
-        ]
+        # カテゴリ別にグループ化。data/categories.json があればその順序を使う
+        category_order = _load_category_order()
         by_cat = defaultdict(list)
         for b in books:
             by_cat[b.get("category") or "その他"].append(b)
+        # 順序リストにないカテゴリは末尾に追加
+        for cat in by_cat:
+            if cat not in category_order:
+                category_order.append(cat)
         sections = []
         sidebar_links = []
         for idx, cat in enumerate(category_order):
@@ -249,18 +268,81 @@ def generate_html(books: list[dict], output_path: Path) -> None:
         sidebar_html = "\n".join(sidebar_links)
         body_content = f"""
     <aside class="sidebar">
+        <div class="view-toggle">
+            <span class="view-toggle-label">表示</span>
+            <div class="view-toggle-btns">
+                <button type="button" id="view-list-btn" aria-pressed="false">リスト表示</button>
+                <button type="button" id="view-grid-btn" class="active" aria-pressed="true">グリッド表示</button>
+            </div>
+        </div>
         <nav class="sidebar-nav">
             <div class="sidebar-title">カテゴリ</div>
 {sidebar_html}
         </nav>
     </aside>
     <main class="main-content">
-    <div class="header">
-        <h1>翔泳社 Kindle 50%オフ セール一覧</h1>
-        <p class="count">合計 {len(books)} 冊</p>
+    <div class="main-header-fixed">
+        <div class="header">
+            <p class="count" id="count-msg" data-total="{len(books)}">合計 {len(books)} 冊</p>
+        </div>
+        <div class="search-bar">
+            <input type="search" id="search-input" placeholder="タイトル・著者で検索..." autocomplete="off" />
+        </div>
     </div>
 """ + "\n".join(sections) + """
     </main>
+    <script>
+    (function () {
+        var STORAGE_KEY = 'kindle-list-view';
+        var listBtn = document.getElementById('view-list-btn');
+        var gridBtn = document.getElementById('view-grid-btn');
+        function setView(mode) {
+            if (mode === 'list') {
+                document.body.classList.add('view-list');
+                listBtn.classList.add('active');
+                listBtn.setAttribute('aria-pressed', 'true');
+                gridBtn.classList.remove('active');
+                gridBtn.setAttribute('aria-pressed', 'false');
+            } else {
+                document.body.classList.remove('view-list');
+                gridBtn.classList.add('active');
+                gridBtn.setAttribute('aria-pressed', 'true');
+                listBtn.classList.remove('active');
+                listBtn.setAttribute('aria-pressed', 'false');
+            }
+            try { localStorage.setItem(STORAGE_KEY, mode); } catch (e) {}
+        }
+        listBtn.addEventListener('click', function () { setView('list'); });
+        gridBtn.addEventListener('click', function () { setView('grid'); });
+        try { var saved = localStorage.getItem(STORAGE_KEY); if (saved === 'list') setView('list'); } catch (e) {}
+        var searchInput = document.getElementById('search-input');
+        var countMsg = document.getElementById('count-msg');
+        var total = parseInt(countMsg.getAttribute('data-total') || '0', 10);
+        var allCards = document.querySelectorAll('.card');
+        var allSections = document.querySelectorAll('.category-section');
+        function runSearch() {
+            var q = (searchInput.value || '').trim().toLowerCase();
+            var visibleCount = 0;
+            allCards.forEach(function (card) {
+                var titleEl = card.querySelector('.card-title');
+                var authorEl = card.querySelector('.card-author');
+                var text = ((titleEl && titleEl.textContent) || '') + ' ' + ((authorEl && authorEl.textContent) || '');
+                var match = !q || text.toLowerCase().indexOf(q) !== -1;
+                if (match) { card.classList.remove('search-no-match'); visibleCount++; }
+                else { card.classList.add('search-no-match'); }
+            });
+            allSections.forEach(function (section) {
+                var sectionCards = section.querySelectorAll('.card');
+                var hasVisible = Array.prototype.some.call(sectionCards, function (c) { return !c.classList.contains('search-no-match'); });
+                section.classList.toggle('search-no-visible', !hasVisible);
+            });
+            countMsg.textContent = q ? ('表示 ' + visibleCount + ' 冊（合計 ' + total + ' 冊）') : ('合計 ' + total + ' 冊');
+        }
+        if (searchInput) { searchInput.addEventListener('input', runSearch); searchInput.addEventListener('search', runSearch); }
+    })();
+    </script>
+</body>
+</html>
 """
 
     html = f"""<!DOCTYPE html>
@@ -272,19 +354,37 @@ def generate_html(books: list[dict], output_path: Path) -> None:
     <style>
         * {{ box-sizing: border-box; }}
         body {{ font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", sans-serif; margin: 0; padding: 0; background: #f5f5f5; display: flex; min-height: 100vh; }}
-        .header {{ max-width: 1200px; margin: 0 auto 1rem; }}
-        h1 {{ font-size: 1.5rem; color: #333; }}
-        .count {{ color: #666; font-size: 0.95rem; }}
+        .main-header-fixed {{ position: sticky; top: 0; z-index: 10; background: #f5f5f5; margin: -1rem -1rem 0 -1rem; padding: 1rem 1rem 0.5rem 1rem; }}
+        .header {{ max-width: 1200px; margin: 0 auto 0.5rem; }}
+        .count {{ color: #666; font-size: 0.95rem; margin: 0; }}
         .sidebar {{ flex-shrink: 0; width: 220px; background: #fff; box-shadow: 1px 0 4px rgba(0,0,0,0.08); padding: 1rem 0; position: sticky; top: 0; max-height: 100vh; overflow-y: auto; }}
         .sidebar-nav {{ display: flex; flex-direction: column; gap: 0.25rem; }}
         .sidebar-title {{ font-weight: bold; font-size: 0.9rem; color: #333; padding: 0 1rem 0.5rem; border-bottom: 1px solid #eee; margin-bottom: 0.5rem; }}
         .sidebar-link {{ display: block; padding: 0.35rem 1rem; font-size: 0.8rem; color: #0066c0; text-decoration: none; border-left: 3px solid transparent; }}
         .sidebar-link:hover {{ background: #f0f7ff; border-left-color: #0066c0; }}
+        .view-toggle {{ padding: 0 1rem 0.75rem; margin-bottom: 0.5rem; border-bottom: 1px solid #eee; }}
+        .view-toggle-label {{ font-size: 0.75rem; color: #666; margin-bottom: 0.35rem; display: block; }}
+        .view-toggle-btns {{ display: flex; gap: 0.25rem; }}
+        .view-toggle-btns button {{ flex: 1; padding: 0.4rem 0.5rem; font-size: 0.75rem; border: 1px solid #ccc; background: #fff; color: #333; border-radius: 4px; cursor: pointer; }}
+        .view-toggle-btns button:hover {{ background: #f5f5f5; border-color: #999; }}
+        .view-toggle-btns button.active {{ background: #0066c0; color: #fff; border-color: #0066c0; }}
         .main-content {{ flex: 1; padding: 1rem; min-width: 0; }}
         .main-content .header {{ padding-left: 0; }}
+        .search-bar {{ max-width: 1200px; margin: 0 auto 0; }}
+        .search-bar input {{ width: 100%; max-width: 400px; padding: 0.5rem 0.75rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 6px; }}
+        .search-bar input:focus {{ outline: none; border-color: #0066c0; box-shadow: 0 0 0 2px rgba(0,102,192,0.2); }}
+        .card.search-no-match {{ display: none !important; }}
+        .category-section.search-no-visible {{ display: none; }}
         .category-section {{ max-width: 1200px; margin: 0 auto 2rem; scroll-margin-top: 1rem; }}
         .category-title {{ font-size: 1.1rem; color: #333; margin: 0 0 0.75rem; padding-bottom: 0.25rem; border-bottom: 2px solid #0066c0; }}
         ul.catalog {{ list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }}
+        body.view-list ul.catalog {{ display: flex; flex-direction: column; gap: 0.5rem; grid-template-columns: none; }}
+        body.view-list .card {{ display: flex; max-width: 100%; }}
+        body.view-list .card-link {{ display: flex; flex: 1; flex-direction: row; align-items: stretch; min-height: 0; }}
+        body.view-list .card-img-wrap {{ width: 72px; min-width: 72px; aspect-ratio: auto; height: auto; align-self: stretch; }}
+        body.view-list .card-img-wrap img {{ width: 72px; height: 96px; object-fit: cover; }}
+        body.view-list .card-body {{ flex: 1; padding: 0.5rem 0.75rem; min-width: 0; display: flex; flex-direction: column; justify-content: center; }}
+        body.view-list .card-title {{ -webkit-line-clamp: 2; }}
         .card {{ margin: 0; padding: 0; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }}
         .card-link {{ text-decoration: none; color: inherit; display: block; height: 100%; }}
         .card-img-wrap {{ aspect-ratio: 3/4; background: #eee; overflow: hidden; }}
@@ -301,8 +401,6 @@ def generate_html(books: list[dict], output_path: Path) -> None:
 </head>
 <body>
 {body_content}
-</body>
-</html>
 """
     output_path.write_text(html, encoding="utf-8")
     print(f"Wrote: {output_path}")

@@ -61,20 +61,47 @@ python scrape_shoeisya_kindle.py --merge-only
 
 ## カテゴリ別表示
 
-1. **分類** … 統合JSONにタイトルからカテゴリを付与する。
+**流れ**: まず「使うカテゴリ一覧」を決め、その一覧を使って各書籍を分類する。
+
+### 1. カテゴリ一覧の抽出
+
+全カテゴリを1つのリストとして `data/categories.json` に出力する。
+
+```bash
+# 現在のキーワードルールからカテゴリ名だけを取り出して保存
+python classify_books.py --extract-categories
+```
+
+API でタイトルからカテゴリ候補を提案させる場合（要 `GOOGLE_API_KEY`）:
+
+```bash
+pip install google-generativeai
+export GOOGLE_API_KEY=your_key
+python classify_books.py --extract-categories --use-api
+```
+
+- 出力先は `--categories-file data/categories.json` で変更可能。
+- 生成された `data/categories.json` を編集すると、HTML のサイドバー・セクションの順序がそのリストに従う。
+
+### 2. 分類
+
+統合JSONの各書籍に、キーワードルールで `category` を付与する。
 
 ```bash
 python classify_books.py data/all_books.json -o data/books_enriched.json
 ```
 
-2. **カテゴリ別HTMLの生成** … 分類済みJSONから、カテゴリごとのセクションでHTMLを出力する。
+- `--no-skip`: 既に category がある書籍も再分類する。
+
+### 3. カテゴリ別HTMLの生成
+
+分類済みJSONから、カテゴリごとのセクションでHTMLを出力する。
 
 ```bash
 python scrape_shoeisya_kindle.py --enriched data/books_enriched.json -o shoeisya_kindle_list.html
 ```
 
-- `classify_books.py` のオプション: `--no-skip` で既存の category も再分類。入力省略時は `data/all_books.json` を使用。
-- カテゴリはキーワードルールで自動付与（資格試験・データベース・インフラ・AI・プログラミング・デザイン・投資・ビジネス・メンタル・その他 など）。
+- 表示順は `data/categories.json` があればその並び、なければスクリプト内の既定順。
 
 ## 注意
 
