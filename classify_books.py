@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 # .env から GEMINI_API_KEY などを読み込む（--use-api 時用）
@@ -129,6 +130,70 @@ def extract_categories_with_api(books: list[dict], output_path: Path, api_key: s
         return False
 
 
+BATCH_SIZE_CLASSIFY = 100  # APIで一度に分類する件数（Geminiのコンテキストを利用）
+
+
+def classify_batch_with_api(
+    books_batch: list[dict],
+    category_names: list[str],
+    api_key: str,
+) -> list[str] | None:
+    """1バッチ分の書籍をAPIで分類し、カテゴリ名のリストを返す。失敗時は None。"""
+    try:
+        from google import genai
+    except ImportError:
+        return None
+    if not books_batch or not category_names:
+        return None
+    # タイトル＋著者を番号付きで送る
+    lines = []
+    for i, b in enumerate(books_batch):
+        title = (b.get("title") or "").strip()
+        author = (b.get("author") or "").strip()
+        lines.append(f"{i}: {title} / {author}")
+    book_list_text = "\n".join(lines)
+    categories_str = "、".join(f'"{c}"' for c in category_names)
+    model_name = os.environ.get("MODEL_NAME") or "gemini-2.0-flash"
+    client = genai.Client(api_key=api_key)
+    prompt = f"""以下は技術書・ビジネス書の「番号: タイトル / 著者」のリストです。
+次のカテゴリのいずれか1つに、それぞれ1冊ずつ分類してください。
+
+【カテゴリ一覧】
+{categories_str}
+
+【ルール】
+- 返答はJSON配列のみ。説明は不要。
+- 配列の長さは必ず {len(books_batch)} 個。先頭から番号 0, 1, 2, ... の本に対応させる。
+- 各要素は上記カテゴリのいずれか（文字列）にすること。必ず一覧に含まれる名前をそのまま使う。
+
+【書籍リスト】
+{book_list_text}
+
+【上記の順序どおりのカテゴリ名のJSON配列】"""
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+        )
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        arr = json.loads(text)
+        if not isinstance(arr, list) or len(arr) != len(books_batch):
+            return None
+        # カテゴリ名が一覧に含まれるかチェックし、含まれなければ「その他」に寄せる
+        cat_set = set(category_names)
+        result = []
+        for c in arr:
+            if isinstance(c, str) and c in cat_set:
+                result.append(c)
+            else:
+                result.append("その他" if "その他" in cat_set else category_names[-1])
+        return result
+    except Exception:
+        return None
+
+
 def classify_by_keywords(title: str) -> tuple[str, list[str]]:
     """タイトルからカテゴリとタグ（キーワードの一部）を返す。"""
     title_lower = title
@@ -199,6 +264,25 @@ def main():
         default=Path("data/categories.json"),
         help="extract 時の出力先 / 分類時に参照するカテゴリ一覧 (default: data/categories.json)",
     )
+    parser.add_argument(
+        "--classify-with-api",
+        action="store_true",
+        help="data/categories.json のカテゴリ一覧を使って、各書籍をAPIで1冊ずつ分類する。先に --extract-categories --use-api を実行しておくこと。",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE_CLASSIFY,
+        metavar="N",
+        help=f"API分類時の1リクエストあたりの冊数 (default: {BATCH_SIZE_CLASSIFY})",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        metavar="SEC",
+        help="--classify-with-api 時: バッチ間の待機秒数 (default: 1.0)",
+    )
     args = parser.parse_args()
 
     # カテゴリ抽出のみ（分類は行わない）
@@ -221,6 +305,60 @@ def main():
             names = get_keyword_category_names()
             extract_categories_to_file(args.categories_file, names)
             print(f"Extracted {len(names)} categories (from keyword rules) -> {args.categories_file}")
+        return 0
+
+    # APIでカテゴリ振り分け（categories.json の一覧を使用）
+    if args.classify_with_api:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            print("Set GEMINI_API_KEY in .env (or GOOGLE_API_KEY) to use --classify-with-api.")
+            return 1
+        categories = load_categories_from_file(args.categories_file)
+        if not categories:
+            print(f"Error: {args.categories_file} not found or empty. Run --extract-categories --use-api first.")
+            return 1
+        if "その他" not in categories:
+            categories.append("その他")
+        if not args.input.exists():
+            print(f"Error: {args.input} not found.")
+            return 1
+        books = load_books(args.input)
+        if not books:
+            print("No books in input.")
+            return 1
+        batch_size = max(1, min(args.batch_size, 150))
+        enriched = []
+        total = len(books)
+        delay_sec = max(0, args.delay)
+        for start in range(0, total, batch_size):
+            if start > 0 and delay_sec > 0:
+                time.sleep(delay_sec)
+            batch = books[start : start + batch_size]
+            end = start + len(batch)
+            print(f"Classifying by API: {start + 1}-{end}/{total} ...", end=" ", flush=True)
+            result = classify_batch_with_api(batch, categories, api_key)
+            if result is None:
+                print("failed, using その他")
+                for b in batch:
+                    out = dict(b)
+                    out["category"] = "その他" if "その他" in categories else categories[-1]
+                    out.setdefault("tags", [])
+                    enriched.append(out)
+            else:
+                for b, cat in zip(batch, result):
+                    out = dict(b)
+                    out["category"] = cat
+                    out.setdefault("tags", [])
+                    enriched.append(out)
+                print("ok")
+        out_path = args.output or (args.input.parent / DEFAULT_ENRICHED_NAME)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(enriched, ensure_ascii=False, indent=0), encoding="utf-8")
+        print(f"Classified {len(enriched)} books (by API) -> {out_path}")
+        from collections import Counter
+        counts = Counter(b["category"] for b in enriched)
+        for cat, n in counts.most_common():
+            print(f"  {cat}: {n}")
         return 0
 
     if not args.input.exists():
